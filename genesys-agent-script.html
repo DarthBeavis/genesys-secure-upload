@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Document Upload — Agent Script</title>
+
+  <!--=================================================================
+      GENESYS AGENT SCRIPT PAGE — Secure Document Upload
+      =================================================================
+      This page runs INSIDE the Genesys Agent Desktop as a Script panel.
+      It is triggered by Copilot NLU suggestion → agent accepts → this
+      page opens with conversation context pre-populated.
+
+      HOW GENESYS PASSES CONTEXT INTO THIS PAGE
+      ─────────────────────────────────────────
+      Genesys Scripts inject variables into the page via:
+        1. URL query parameters (most common for web pages):
+              ?conversationId=xxx&participantId=xxx&customerId=xxx
+        2. The Genesys Scripts postMessage API (if using iframe binding)
+        3. window.scriptVariables (if configured in Script designer)
+
+      This page handles all three and falls back gracefully.
+      In the Genesys Script designer, map these Script variables
+      to the page URL:
+          {{conversationId}}  → Conversation.ConversationId
+          {{participantId}}   → Conversation.ParticipantId (customer)
+          {{customerId}}      → Customer identifier (from your data dip)
+          {{identifierType}}  → LOANS | ACCOUNTS | NEWMEMBER (from flow)
+          {{identifier}}      → LoanID / PersonNumber / ApplicationID
+
+      WHAT THIS PAGE DOES
+      ─────────────────────────────────────────
+      1. Agent receives Copilot suggestion "Customer wants to upload doc"
+      2. Agent clicks Accept → this Script page opens in their panel
+      3. Agent sends a chat message to the customer requesting the doc
+         (one click — uses Genesys Platform API with conversation context)
+      4. Agent sees a live status panel waiting for upload
+      5. Customer uploads via the secure modal on their page
+         (scanned by the customer-facing page)
+      6. THIS page also calls the document API directly with full context:
+           POST https://xxx.xxx.xxx/genesys-chat/upload/document
+           identifierType, identifier, files — all wired
+      7. Agent sees SUCCESS with documentId, requestId, timestamp
+
+      CONFIGURATION
+      ─────────────────────────────────────────
+      Set the constants in the CONFIG block below.
+  =================================================================-->
+
+  <style>
+    /* ── TOKENS ─────────────────────────────────────────────── */
+    :root {
+      --bg:        #f0f2f8;
+      --panel:     #ffffff;
+      --panel2:    #f7f8fc;
+      --border:    #dde2ee;
+      --text:      #1c2136;
+      --muted:     #7b8aaa;
+      --accent:    #3b5bdb;
+      --accent-lt: #e8ecfb;
+      --success:   #0b9e6e;
+      --success-lt:#e6f9f3;
+      --danger:    #dc2626;
+      --danger-lt: #fef2f2;
+      --warning:   #d97706;
+      --warning-lt:#fffbeb;
+      --orange:    #ea580c;
+      --r:         8px;
+      --shadow:    0 1px 4px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.06);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    /* Script pages render in a constrained panel — compact layout */
+    .app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      padding: 12px;
+      gap: 10px;
+      overflow-y: auto;
+    }
+
+    /* ── HEADER BAR ─────────────────────────────────────────── */
+    .header {
+      background: var(--accent);
+      border-radius: var(--r);
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: #fff;
+      flex-shrink: 0;
+    }
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header-icon {
+      width: 28px; height: 28px;
+      background: rgba(255,255,255,.2);
+      border-radius: 6px;
+      display: grid; place-items: center;
+      font-size: .95rem;
+    }
+    .header h1 {
+      font-size: .88rem;
+      font-weight: 600;
+      letter-spacing: .01em;
+    }
+    .header p {
+      font-size: .7rem;
+      opacity: .75;
+      margin-top: 1px;
+    }
+    .copilot-badge {
+      background: rgba(255,255,255,.18);
+      border: 1px solid rgba(255,255,255,.3);
+      border-radius: 20px;
+      padding: 3px 10px;
+      font-size: .66rem;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    /* ── CONTEXT CARD ───────────────────────────────────────── */
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+    }
+    .card-title {
+      font-size: .68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--muted);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .card-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* Context grid */
+    .ctx-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .ctx-field { display: flex; flex-direction: column; gap: 2px; }
+    .ctx-label {
+      font-size: .68rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .ctx-value {
+      font-size: .82rem;
+      font-weight: 500;
+      color: var(--text);
+      font-family: 'Consolas', 'Courier New', monospace;
+    }
+    .ctx-value.missing { color: var(--warning); font-style: italic; font-family: inherit; }
+
+    /* ── IDENTIFIER FORM ────────────────────────────────────── */
+    .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      font-size: .7rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .field label .req { color: var(--danger); margin-left: 2px; }
+
+    .field select,
+    .field input[type="text"] {
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: .83rem;
+      padding: 7px 10px;
+      outline: none;
+      width: 100%;
+      transition: border-color .15s;
+      appearance: none;
+    }
+    .field select:focus,
+    .field input[type="text"]:focus { border-color: var(--accent); }
+    .field select option { background: #fff; }
+
+    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .field-hint { font-size: .68rem; color: var(--muted); margin-top: 2px; }
+
+    /* ── FILE DROP ZONE ─────────────────────────────────────── */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--r);
+      padding: 22px 12px;
+      text-align: center;
+      cursor: pointer;
+      background: var(--panel2);
+      transition: border-color .15s, background .15s;
+    }
+    #drop-zone:hover, #drop-zone.over {
+      border-color: var(--accent);
+      background: var(--accent-lt);
+    }
+    #drop-zone .dz-ico { font-size: 1.6rem; display: block; margin-bottom: 6px; }
+    #drop-zone h3 { font-size: .82rem; font-weight: 600; margin-bottom: 3px; }
+    #drop-zone p  { font-size: .7rem; color: var(--muted); }
+    #file-input { display: none; }
+
+    /* ── FILE CHIP ──────────────────────────────────────────── */
+    #file-chip {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      margin-top: 8px;
+    }
+    #file-chip.show { display: flex; }
+    .fc-ico {
+      width: 30px; height: 30px; border-radius: 6px;
+      background: var(--accent-lt); display: grid;
+      place-items: center; font-size: .9rem; flex-shrink: 0;
+    }
+    .fc-name { font-size: .8rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex:1; min-width:0; }
+    .fc-size { font-size: .68rem; color: var(--muted); }
+    .fc-clear { font-size: .75rem; color: var(--accent); cursor: pointer; flex-shrink:0; }
+    .fc-clear:hover { text-decoration: underline; }
+
+    /* ── PROGRESS ───────────────────────────────────────────── */
+    #prog-section { display: none; margin-top: 8px; }
+    #prog-section.show { display: block; }
+    .prog-row {
+      display: flex; justify-content: space-between;
+      font-size: .72rem; font-weight: 500; margin-bottom: 4px;
+    }
+    .prog-pct { color: var(--muted); }
+    .prog-track {
+      height: 5px; background: var(--border);
+      border-radius: 3px; overflow: hidden;
+    }
+    .prog-bar {
+      height: 100%; border-radius: 3px;
+      background: var(--accent);
+      transition: width .3s ease, background .3s;
+    }
+    .prog-bar.scan    { background: var(--warning); }
+    .prog-bar.upload  { background: var(--accent); }
+    .prog-bar.success { background: var(--success); }
+    .prog-bar.error   { background: var(--danger); }
+
+    /* ── STATUS BANNER ──────────────────────────────────────── */
+    #status-banner {
+      display: none; gap: 8px; padding: 9px 12px;
+      border-radius: 6px; font-size: .78rem; line-height: 1.5;
+      margin-top: 8px;
+    }
+    #status-banner.show    { display: flex; align-items: flex-start; }
+    #status-banner.success { background: var(--success-lt); color: #065f46; border: 1px solid #a7f3d0; }
+    #status-banner.error   { background: var(--danger-lt);  color: #991b1b; border: 1px solid #fecaca; }
+    #status-banner.warning { background: var(--warning-lt); color: #92400e; border: 1px solid #fde68a; }
+    #status-banner.info    { background: var(--accent-lt);  color: #1e3a8a; border: 1px solid #bfdbfe; }
+
+    /* ── BUTTONS ────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 6px; padding: 9px 14px;
+      border: none; border-radius: 6px;
+      font-size: .8rem; font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      width: 100%;
+    }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn:not(:disabled):active { transform: scale(.98); }
+
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:not(:disabled):hover { opacity: .88; }
+    .btn-primary.success { background: var(--success); }
+
+    .btn-secondary {
+      background: var(--panel2); color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:not(:disabled):hover { background: var(--border); }
+
+    .btn-sm { padding: 6px 12px; font-size: .74rem; width: auto; }
+
+    /* ── NOTIFY CUSTOMER SECTION ────────────────────────────── */
+    .notify-row {
+      display: flex; gap: 8px; align-items: center;
+      padding: 10px 12px;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .notify-row p {
+      flex: 1;
+      font-size: .76rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .notify-row p strong { color: var(--text); }
+    #notify-sent-badge {
+      display: none;
+      font-size: .68rem;
+      font-weight: 600;
+      background: var(--success-lt);
+      color: var(--success);
+      border: 1px solid #a7f3d0;
+      border-radius: 20px;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+    #notify-sent-badge.show { display: inline-block; }
+
+    /* ── RESULT PANEL ───────────────────────────────────────── */
+    #result-panel {
+      display: none;
+      background: var(--success-lt);
+      border: 1px solid #6ee7b7;
+      border-radius: var(--r);
+      padding: 14px;
+    }
+    #result-panel.show { display: block; }
+    .result-header {
+      display: flex; align-items: center; gap: 6px;
+      font-size: .82rem; font-weight: 700; color: var(--success);
+      margin-bottom: 10px;
+    }
+    .result-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    }
+    .result-field { display: flex; flex-direction: column; gap: 2px; }
+    .result-label {
+      font-size: .65rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .06em; color: #059669;
+    }
+    .result-value {
+      font-size: .78rem; font-weight: 500;
+      color: var(--text);
+      font-family: 'Consolas', 'Courier New', monospace;
+      word-break: break-all;
+    }
+
+    /* ── DIVIDER ────────────────────────────────────────────── */
+    hr { border: none; border-top: 1px solid var(--border); margin: 2px 0; }
+
+    /* ── SCROLLBAR ──────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── HEADER ──────────────────────────────────────────────── -->
+  <div class="header">
+    <div class="header-left">
+      <div class="header-icon">📎</div>
+      <div>
+        <h1>Secure Document Upload</h1>
+        <p>Agent-assisted · Malware scanned before delivery</p>
+      </div>
+    </div>
+    <span class="copilot-badge">⚡ Copilot</span>
+  </div>
+
+  <!-- ── CONVERSATION CONTEXT ────────────────────────────────── -->
+  <!--
+    These values are populated from Genesys Script variables.
+    In the Script designer, map URL parameters or Script variables:
+      conversationId  → shown as read-only reference
+      identifierType  → pre-selects the dropdown if known from data dip
+      identifier      → pre-fills the ID field if known from data dip
+  -->
+  <div class="card">
+    <div class="card-title">Conversation Context</div>
+    <div class="ctx-grid">
+      <div class="ctx-field">
+        <div class="ctx-label">Conversation ID</div>
+        <div class="ctx-value" id="ctx-conv-id">Loading…</div>
+      </div>
+      <div class="ctx-field">
+        <div class="ctx-label">Customer ID</div>
+        <div class="ctx-value" id="ctx-customer-id">—</div>
+      </div>
+      <div class="ctx-field">
+        <div class="ctx-label">Identifier Type</div>
+        <div class="ctx-value" id="ctx-id-type">—</div>
+      </div>
+      <div class="ctx-field">
+        <div class="ctx-label">Identifier</div>
+        <div class="ctx-value" id="ctx-identifier">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── STEP 1: NOTIFY CUSTOMER ─────────────────────────────── -->
+  <!--
+    Agent clicks this to send a structured message to the customer
+    via Genesys Platform API. This triggers the toast + modal on
+    the customer's web page (Method 2 from the customer-facing script).
+    Uses the conversationId from Script context.
+  -->
+  <div class="card">
+    <div class="card-title">Step 1 — Request Document from Customer</div>
+    <div class="notify-row">
+      <p>
+        <strong>Send upload request to customer.</strong><br>
+        This opens the secure upload modal on their screen automatically.
+      </p>
+      <span id="notify-sent-badge">✓ Sent</span>
+      <button class="btn btn-secondary btn-sm" id="notify-btn">
+        💬 Request Doc
+      </button>
+    </div>
+  </div>
+
+  <!-- ── STEP 2: IDENTIFIER ───────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Step 2 — Confirm Identifier</div>
+    <div class="field-row">
+      <div class="field">
+        <label for="id-type">Identifier Type <span class="req">*</span></label>
+        <select id="id-type">
+          <option value="">— Select —</option>
+          <option value="LOANS">LOANS</option>
+          <option value="ACCOUNTS">ACCOUNTS</option>
+          <option value="NEWMEMBER">NEWMEMBER</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="identifier">Identifier Value <span class="req">*</span></label>
+        <input type="text" id="identifier" placeholder="e.g. 4587902" />
+        <div class="field-hint" id="id-hint">LoanID · PersonNumber · ApplicationID</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── STEP 3: FILE + UPLOAD ────────────────────────────────── -->
+  <!--
+    The agent can ALSO upload on the customer's behalf if needed
+    (e.g. customer emailed the file, agent received it separately).
+    More commonly, the customer uploads via their page and the agent
+    monitors the status shown in this panel.
+  -->
+  <div class="card">
+    <div class="card-title">Step 3 — Attach &amp; Submit Document</div>
+
+    <div id="drop-zone" role="button" tabindex="0"
+         aria-label="Click or drop a file to attach">
+      <span class="dz-ico">📂</span>
+      <h3>Drop file or click to browse</h3>
+      <p>PDF · DOCX · PNG · JPG · TXT · Max 10 MB</p>
+    </div>
+    <input type="file" id="file-input"
+           accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.txt,.csv" />
+
+    <div id="file-chip">
+      <div class="fc-ico" id="fc-ico">📄</div>
+      <div style="flex:1;min-width:0">
+        <div class="fc-name" id="fc-name"></div>
+        <div class="fc-size" id="fc-size"></div>
+      </div>
+      <span class="fc-clear" id="fc-clear">✕ Change</span>
+    </div>
+
+    <div id="prog-section">
+      <div class="prog-row">
+        <span id="prog-label">Submitting…</span>
+        <span class="prog-pct" id="prog-pct">0%</span>
+      </div>
+      <div class="prog-track">
+        <div class="prog-bar" id="prog-bar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <div id="status-banner"></div>
+
+    <button class="btn btn-primary" id="upload-btn"
+            style="margin-top:10px" disabled>
+      <span id="upload-btn-ico">⬆</span>
+      <span id="upload-btn-lbl">Submit to Document Service</span>
+    </button>
+  </div>
+
+  <!-- ── RESULT PANEL (shown on success) ─────────────────────── -->
+  <div id="result-panel">
+    <div class="result-header">
+      ✅ Document Successfully Submitted
+    </div>
+    <div class="result-grid">
+      <div class="result-field">
+        <div class="result-label">Request ID</div>
+        <div class="result-value" id="res-request-id">—</div>
+      </div>
+      <div class="result-field">
+        <div class="result-label">Document ID</div>
+        <div class="result-value" id="res-doc-id">—</div>
+      </div>
+      <div class="result-field">
+        <div class="result-label">Title</div>
+        <div class="result-value" id="res-title">—</div>
+      </div>
+      <div class="result-field">
+        <div class="result-label">Uploaded</div>
+        <div class="result-value" id="res-datetime">—</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+
+<!--=================================================================
+    JAVASCRIPT
+    =================================================================
+
+    CONTEXT INJECTION — how Genesys passes variables to this page
+    ─────────────────────────────────────────────────────────────────
+    Genesys Script pages receive context three ways (all handled):
+
+      1. URL params (most common):
+            script.html?conversationId=abc&identifierType=LOANS&identifier=4587902
+
+      2. window.scriptVariables (if Script designer binds variables)
+
+      3. postMessage from parent frame (Genesys desktop iframe)
+
+    The CONFIG block also supports hard-coded fallback values for
+    development/testing.
+
+    UPLOAD API
+    ─────────────────────────────────────────────────────────────────
+    POST https://xxx.xxx.xxx/genesys-chat/upload/document
+    Authorization: Basic base64(username:password)
+    Content-Type: multipart/form-data
+
+    Body:
+      identifierType  LOANS | ACCOUNTS | NEWMEMBER
+      identifier      LoanID | PersonNumber | ApplicationID
+      files           (file binary)
+
+    Success response:
+      { requestId, documentId, title, status:"SUCCESS", uploadedDateTime }
+
+    Error response:
+      { requestId, errors:[{ code, message }] }
+
+    NOTIFY CUSTOMER
+    ─────────────────────────────────────────────────────────────────
+    Uses Genesys Platform API to send a message INTO the active
+    conversation from the agent side. This triggers the
+    messagesReceived event on the customer's page, which shows
+    the toast and opens the upload modal automatically.
+
+      POST /api/v2/conversations/{conversationId}/messages
+      Authorization: Bearer {agentOAuthToken}
+      { "textBody": "please upload your document" }
+
+    NOTE: The agent OAuth token is available inside Script pages via
+    window.mypurecloud?.getAccessToken() or the Script SDK.
+    See CONFIG section — set GENESYS_API_BASE to your org's region.
+=================================================================-->
+<script>
+(function () {
+  'use strict';
+
+  /* ─────────────────────────────────────────────────────────────
+     ★  CONFIG — replace all values marked REPLACE
+  ──────────────────────────────────────────────────────────────── */
+
+  // Document upload API (from your spec)
+  const DOC_API_URL  = 'https://xxx.xxx.xxx/genesys-chat/upload/document'; // ← REPLACE
+  const DOC_API_USER = 'myusername';   // ← REPLACE
+  const DOC_API_PASS = 'mypassword';   // ← REPLACE
+
+  // Genesys Platform API base URL for your org region
+  // e.g. 'https://api.mypurecloud.com' or 'https://api.mypurecloud.ie'
+  const GENESYS_API_BASE = 'https://api.mypurecloud.com'; // ← REPLACE
+
+  // Message sent to customer to trigger the upload modal on their screen.
+  // Must contain the TRIGGER_PHRASE configured in the customer-facing page
+  // (default: "please upload")
+  const CUSTOMER_NOTIFY_MSG = 'Please upload your document using the secure upload button on this page.';
+
+  // File constraints — match your server's limits
+  const MAX_BYTES = 10 * 1024 * 1024;
+  const ALLOWED_MIME = new Set([
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'image/png', 'image/jpeg',
+    'text/plain', 'text/csv'
+  ]);
+
+  const ID_HINTS = {
+    LOANS:     'Enter LoanID',
+    ACCOUNTS:  'Enter PersonNumber',
+    NEWMEMBER: 'Enter ApplicationID'
+  };
+
+  /* ─────────────────────────────────────────────────────────────
+     CONTEXT RESOLUTION
+     Priority: URL params → window.scriptVariables → postMessage
+  ──────────────────────────────────────────────────────────────── */
+  const ctx = {
+    conversationId: '',
+    participantId:  '',
+    customerId:     '',
+    identifierType: '',
+    identifier:     ''
+  };
+
+  function resolveContext() {
+    // 1. URL query parameters (most reliable for Script web pages)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('conversationId')) ctx.conversationId = params.get('conversationId');
+    if (params.get('participantId'))  ctx.participantId  = params.get('participantId');
+    if (params.get('customerId'))     ctx.customerId     = params.get('customerId');
+    if (params.get('identifierType')) ctx.identifierType = params.get('identifierType');
+    if (params.get('identifier'))     ctx.identifier     = params.get('identifier');
+
+    // 2. Genesys Script SDK variable binding
+    try {
+      const sv = window.scriptVariables || window.genesysScriptVariables || {};
+      if (sv.conversationId) ctx.conversationId = sv.conversationId;
+      if (sv.participantId)  ctx.participantId  = sv.participantId;
+      if (sv.customerId)     ctx.customerId     = sv.customerId;
+      if (sv.identifierType) ctx.identifierType = sv.identifierType;
+      if (sv.identifier)     ctx.identifier     = sv.identifier;
+    } catch (_) {}
+
+    renderContext();
+    prefillForm();
+  }
+
+  // 3. postMessage from Genesys desktop iframe parent
+  window.addEventListener('message', e => {
+    if (!e.data || typeof e.data !== 'object') return;
+    const d = e.data;
+    if (d.conversationId) { ctx.conversationId = d.conversationId; renderContext(); prefillForm(); }
+    if (d.participantId)  ctx.participantId  = d.participantId;
+    if (d.customerId)     { ctx.customerId    = d.customerId;  renderContext(); }
+    if (d.identifierType) { ctx.identifierType = d.identifierType; prefillForm(); }
+    if (d.identifier)     { ctx.identifier    = d.identifier;  prefillForm(); }
+  });
+
+  function renderContext() {
+    const set = (id, val) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (val) {
+        el.textContent = val;
+        el.classList.remove('missing');
+      } else {
+        el.textContent = 'Not provided';
+        el.classList.add('missing');
+      }
+    };
+    set('ctx-conv-id',    ctx.conversationId);
+    set('ctx-customer-id',ctx.customerId);
+    set('ctx-id-type',    ctx.identifierType);
+    set('ctx-identifier', ctx.identifier);
+  }
+
+  function prefillForm() {
+    if (ctx.identifierType && idTypeEl.querySelector(`option[value="${ctx.identifierType}"]`)) {
+      idTypeEl.value = ctx.identifierType;
+      updateIdHint();
+    }
+    if (ctx.identifier) {
+      identifierEl.value = ctx.identifier;
+    }
+    refreshUploadBtn();
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+     DOM REFS
+  ──────────────────────────────────────────────────────────────── */
+  const idTypeEl      = document.getElementById('id-type');
+  const identifierEl  = document.getElementById('identifier');
+  const idHintEl      = document.getElementById('id-hint');
+  const notifyBtn     = document.getElementById('notify-btn');
+  const notifyBadge   = document.getElementById('notify-sent-badge');
+  const dropZone      = document.getElementById('drop-zone');
+  const fileInput     = document.getElementById('file-input');
+  const fileChip      = document.getElementById('file-chip');
+  const fcIco         = document.getElementById('fc-ico');
+  const fcName        = document.getElementById('fc-name');
+  const fcSize        = document.getElementById('fc-size');
+  const fcClear       = document.getElementById('fc-clear');
+  const progSection   = document.getElementById('prog-section');
+  const progLabel     = document.getElementById('prog-label');
+  const progPct       = document.getElementById('prog-pct');
+  const progBar       = document.getElementById('prog-bar');
+  const statusBanner  = document.getElementById('status-banner');
+  const uploadBtn     = document.getElementById('upload-btn');
+  const uploadBtnIco  = document.getElementById('upload-btn-ico');
+  const uploadBtnLbl  = document.getElementById('upload-btn-lbl');
+  const resultPanel   = document.getElementById('result-panel');
+
+  /* ─────────────────────────────────────────────────────────────
+     HELPERS
+  ──────────────────────────────────────────────────────────────── */
+  let selectedFile = null;
+  let submitting   = false;
+
+  function fmt(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+    return (b/1048576).toFixed(2) + ' MB';
+  }
+  function mimeIco(mime) {
+    if (mime === 'application/pdf') return '📄';
+    if (mime.startsWith('image/'))  return '🖼️';
+    if (mime.includes('word'))      return '📝';
+    return '📎';
+  }
+  function setProgress(label, pct, cls) {
+    progSection.classList.add('show');
+    progLabel.textContent = label;
+    progPct.textContent   = pct + '%';
+    progBar.style.width   = pct + '%';
+    progBar.className     = 'prog-bar ' + (cls || '');
+  }
+  function hideProgress() {
+    progSection.classList.remove('show');
+  }
+  function showBanner(text, type) {
+    const icons = { success:'✅', error:'❌', warning:'⚠️', info:'ℹ️' };
+    statusBanner.className   = 'show ' + type;
+    statusBanner.textContent = (icons[type] || '') + '  ' + text;
+  }
+  function hideBanner() { statusBanner.className = ''; }
+
+  function refreshUploadBtn() {
+    uploadBtn.disabled = !(idTypeEl.value && identifierEl.value.trim() && selectedFile && !submitting);
+  }
+
+  function updateIdHint() {
+    idHintEl.textContent = ID_HINTS[idTypeEl.value] || 'LoanID · PersonNumber · ApplicationID';
+  }
+
+  idTypeEl.addEventListener('change',   () => { updateIdHint(); refreshUploadBtn(); });
+  identifierEl.addEventListener('input', refreshUploadBtn);
+
+  /* ─────────────────────────────────────────────────────────────
+     FILE HANDLING
+  ──────────────────────────────────────────────────────────────── */
+  function handleFile(file) {
+    if (!file) return;
+    hideBanner();
+    if (!ALLOWED_MIME.has(file.type)) {
+      showBanner(`Unsupported file type: ${file.type || 'unknown'}. Use PDF, DOCX, PNG, JPG, or TXT.`, 'error');
+      return;
+    }
+    if (file.size > MAX_BYTES) {
+      showBanner(`File too large: ${fmt(file.size)}. Maximum is ${fmt(MAX_BYTES)}.`, 'error');
+      return;
+    }
+    selectedFile = file;
+    dropZone.style.display = 'none';
+    fcIco.textContent  = mimeIco(file.type);
+    fcName.textContent = file.name;
+    fcSize.textContent = fmt(file.size);
+    fileChip.classList.add('show');
+    refreshUploadBtn();
+  }
+
+  dropZone.addEventListener('click',    () => fileInput.click());
+  dropZone.addEventListener('keydown',  e  => { if (e.key==='Enter'||e.key===' ') fileInput.click(); });
+  dropZone.addEventListener('dragover', e  => { e.preventDefault(); dropZone.classList.add('over'); });
+  dropZone.addEventListener('dragleave',() => dropZone.classList.remove('over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('over');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleFile(fileInput.files[0]);
+    fileInput.value = '';
+  });
+  fcClear.addEventListener('click', () => {
+    selectedFile = null;
+    fileChip.classList.remove('show');
+    dropZone.style.display = '';
+    hideBanner(); hideProgress();
+    refreshUploadBtn();
+  });
+
+  /* ─────────────────────────────────────────────────────────────
+     STEP 1 — NOTIFY CUSTOMER
+     ─────────────────────────────────────────────────────────────
+     Sends a message into the active web messaging conversation
+     via the Genesys Platform API. This triggers the
+     messagesReceived SDK event on the customer's page, which
+     shows the upload toast and auto-opens the secure upload modal.
+
+     Requires: conversationId from Script context
+               Agent OAuth token (retrieved from Genesys SDK)
+
+     Platform API endpoint:
+       POST /api/v2/conversations/{conversationId}/messages
+       Authorization: Bearer {token}
+       Content-Type: application/json
+       { "textBody": "...", "messagingTemplate": null }
+
+     Note: In a Script page context the agent's OAuth token is
+     available via window.mypurecloud.getAccessToken() if the
+     Genesys desktop SDK is loaded, or via the Script SDK
+     pcConversations / communication helpers.
+  ──────────────────────────────────────────────────────────────── */
+  notifyBtn.addEventListener('click', async () => {
+    if (!ctx.conversationId) {
+      showBanner('No conversationId available. Ensure Script variables are mapped correctly.', 'error');
+      return;
+    }
+
+    notifyBtn.disabled = true;
+    notifyBtn.textContent = '⏳ Sending…';
+
+    try {
+      // Retrieve the agent's OAuth token from the Genesys desktop SDK
+      // In Genesys Script pages this is typically available as:
+      //   window.mypurecloud.getAccessToken()  — legacy desktop
+      //   window.purecloud.getAccessToken()     — newer desktop
+      // Adjust to match your desktop SDK version.
+      let token = null;
+      try {
+        token = window.mypurecloud?.getAccessToken?.()
+             || window.purecloud?.getAccessToken?.()
+             || null;
+      } catch (_) {}
+
+      if (!token) {
+        // Fallback: if token not available via SDK, show instruction
+        // In production you may proxy this through your own backend
+        throw new Error(
+          'Agent OAuth token not available from desktop SDK. ' +
+          'Send the message manually or configure token retrieval.'
+        );
+      }
+
+      const res = await fetch(
+        `${GENESYS_API_BASE}/api/v2/conversations/${ctx.conversationId}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type':  'application/json'
+          },
+          body: JSON.stringify({ textBody: CUSTOMER_NOTIFY_MSG })
+        }
+      );
+
+      if (!res.ok) throw new Error(`Platform API HTTP ${res.status}`);
+
+      notifyBtn.textContent = '✓ Sent';
+      notifyBadge.classList.add('show');
+      showBanner('Customer has been notified. The upload modal will appear on their screen.', 'success');
+
+    } catch (err) {
+      notifyBtn.disabled    = false;
+      notifyBtn.textContent = '💬 Request Doc';
+      showBanner(`Could not notify customer: ${err.message}`, 'warning');
+    }
+  });
+
+  /* ─────────────────────────────────────────────────────────────
+     STEP 3 — DOCUMENT API UPLOAD
+     ─────────────────────────────────────────────────────────────
+     POST multipart/form-data to the document API.
+     Authorization: HTTP Basic (username:password)
+
+     This runs on the AGENT side — credentials are never exposed
+     to the customer's browser.
+
+     Flow:
+       1. Build FormData with identifierType, identifier, files
+       2. POST to DOC_API_URL with Basic Auth
+       3. Parse response:
+            SUCCESS → show result panel with requestId, documentId
+            FAILED  → show error code + hint
+       4. Show result to agent for confirmation
+  ──────────────────────────────────────────────────────────────── */
+  uploadBtn.addEventListener('click', async () => {
+    if (!selectedFile || submitting) return;
+    if (!idTypeEl.value || !identifierEl.value.trim()) {
+      showBanner('Please complete the Identifier Type and Value fields.', 'warning');
+      return;
+    }
+
+    submitting = true;
+    uploadBtn.disabled   = true;
+    uploadBtnIco.textContent = '⏳';
+    uploadBtnLbl.textContent = 'Submitting…';
+    hideBanner();
+    resultPanel.classList.remove('show');
+
+    const file       = selectedFile;
+    const identType  = idTypeEl.value;
+    const identValue = identifierEl.value.trim();
+
+    // Progress animation
+    let tick = 5;
+    setProgress('Submitting to document service…', tick, '');
+    const ticker = setInterval(() => {
+      tick = Math.min(tick + 9, 88);
+      setProgress('Submitting to document service…', tick, '');
+    }, 280);
+
+    try {
+      // Build multipart form — matches API spec exactly
+      const form = new FormData();
+      form.append('identifierType', identType);
+      form.append('identifier',     identValue);
+      form.append('files',          file, file.name);
+
+      const res = await fetch(DOC_API_URL, {
+        method:  'POST',
+        headers: {
+          'Authorization': 'Basic ' + btoa(`${DOC_API_USER}:${DOC_API_PASS}`)
+          // Do NOT set Content-Type — browser sets it with correct boundary
+        },
+        body: form
+      });
+
+      clearInterval(ticker);
+
+      let data = null;
+      try { data = await res.json(); } catch (_) {}
+
+      /* ── SUCCESS ────────────────────────────────────────── */
+      if (res.ok && data?.status === 'SUCCESS') {
+        setProgress('Submitted successfully', 100, 'success');
+
+        // Populate result panel
+        document.getElementById('res-request-id').textContent = data.requestId        || '—';
+        document.getElementById('res-doc-id').textContent     = data.documentId       || '—';
+        document.getElementById('res-title').textContent      = data.title            || '—';
+        document.getElementById('res-datetime').textContent   = data.uploadedDateTime || '—';
+        resultPanel.classList.add('show');
+
+        uploadBtn.className  = 'btn btn-primary success';
+        uploadBtnIco.textContent = '✅';
+        uploadBtnLbl.textContent = 'Submitted Successfully';
+
+        setTimeout(hideProgress, 2000);
+
+      /* ── API-LEVEL FAILURE ─────────────────────────────── */
+      } else {
+        const code  = data?.errors?.[0]?.code    || `HTTP_${res.status}`;
+        const msg   = data?.errors?.[0]?.message || res.statusText || 'Unknown error';
+        const reqId = data?.requestId            || '—';
+
+        setProgress('Submission failed', 100, 'error');
+
+        // Human-readable guidance per documented error codes
+        const hints = {
+          'INVALID_FILE_TYPE':     'The file format is not accepted by the document service.',
+          'INVALID_FILE_SIZE':     'The file is too large. Try compressing or splitting it.',
+          'AUTHORIZATION_FAILURE': 'API credentials are invalid — check DOC_API_USER / PASS in config.',
+          'UPLOAD_ERROR':          'File may be corrupted or rejected by the downstream system.',
+          'INVALID_FILE':          'A general error occurred. Try a different file.',
+          'TIMEOUT':               'The request timed out. Try again or use a smaller file.'
+        };
+
+        showBanner(
+          `${code}: ${msg}${hints[code] ? '\n' + hints[code] : ''}  (requestId: ${reqId})`,
+          'error'
+        );
+
+        uploadBtn.disabled       = false;
+        uploadBtnIco.textContent = '⬆';
+        uploadBtnLbl.textContent = 'Submit to Document Service';
+        submitting = false;
+      }
+
+    } catch (err) {
+      clearInterval(ticker);
+      hideProgress();
+      showBanner(`Network error: ${err.message}`, 'error');
+      uploadBtn.disabled       = false;
+      uploadBtnIco.textContent = '⬆';
+      uploadBtnLbl.textContent = 'Submit to Document Service';
+      submitting = false;
+    }
+  });
+
+  /* ─────────────────────────────────────────────────────────────
+     INIT
+  ──────────────────────────────────────────────────────────────── */
+  resolveContext();
+
+})();
+</script>
+</body>
+</html>
