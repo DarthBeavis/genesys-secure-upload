@@ -132,6 +132,61 @@
     }
     #upload-toast .toast-close:hover { opacity: 1; }
 
+    /* ── FLOATING ACTION BUTTON ─────────────────────────────────
+       Appears above the Genesys widget launcher when agent triggers
+       the upload request. Works regardless of what page the customer
+       is on — positioned bottom-right just above the widget button.
+       Pulses to draw attention, dismissed when modal opens.
+    ──────────────────────────────────────────────────────────── */
+    #upload-fab {
+      position: fixed;
+      bottom: 90px;          /* sits above the Genesys launcher bubble */
+      right: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 50px;
+      padding: 13px 20px 13px 16px;
+      font-size: .88rem;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 4px 24px rgba(67,97,238,.45);
+      z-index: 10001;
+      white-space: nowrap;
+      /* hidden by default */
+      opacity: 0;
+      transform: translateY(20px) scale(.9);
+      pointer-events: none;
+      transition: opacity .3s cubic-bezier(.16,1,.3,1),
+                  transform .3s cubic-bezier(.16,1,.3,1);
+    }
+    #upload-fab.show {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+      pointer-events: auto;
+      animation: fab-pulse 2s ease-in-out 0.4s 3; /* pulse 3 times after appearing */
+    }
+    @keyframes fab-pulse {
+      0%, 100% { box-shadow: 0 4px 24px rgba(67,97,238,.45); }
+      50%       { box-shadow: 0 4px 40px rgba(67,97,238,.8), 0 0 0 8px rgba(67,97,238,.15); }
+    }
+    #upload-fab .fab-ico {
+      width: 28px; height: 28px;
+      background: rgba(255,255,255,.2);
+      border-radius: 50%;
+      display: grid; place-items: center;
+      font-size: .9rem;
+      flex-shrink: 0;
+    }
+    #upload-fab:hover {
+      background: var(--accent-h);
+      transform: translateY(-2px) scale(1.02);
+    }
+    #upload-fab:active { transform: scale(.97); }
+
     /* ── MODAL OVERLAY ──────────────────────────────────────── */
     #upload-modal {
       display: none;
@@ -420,6 +475,19 @@
   </div>
 
   <!--=================================================================
+      TRIGGER METHOD 2b — FLOATING ACTION BUTTON
+      Appears bottom-right (just above the Genesys widget bubble)
+      when the agent sends the trigger message. Works on ANY page
+      the customer is on — no page context required.
+      Pulses 3 times to draw attention, then stays steady.
+      Clicking opens the upload modal.
+  =================================================================-->
+  <button id="upload-fab" aria-haspopup="dialog" aria-label="Upload secure document">
+    <span class="fab-ico">📎</span>
+    Upload Secure Document
+  </button>
+
+  <!--=================================================================
       UPLOAD MODAL
   =================================================================-->
   <div id="upload-modal" role="dialog" aria-modal="true"
@@ -614,6 +682,7 @@
   const toast       = document.getElementById('upload-toast');
   const toastClose  = document.getElementById('toast-close');
   const toastMsgEl  = document.getElementById('toast-msg');
+  const fab         = document.getElementById('upload-fab');
   const dropZone    = document.getElementById('drop-zone');
   const fileInput   = document.getElementById('file-input');
   const fileChip    = document.getElementById('file-chip');
@@ -683,16 +752,31 @@
     clearTimeout(toastTimer);
     toastMsgEl.textContent = text || TOAST_TEXT;
     toast.classList.add('show');
-    // auto-hide after 12 s if not clicked
+    // auto-hide toast after 12 s — FAB stays until modal opens
     toastTimer = setTimeout(hideToast, 12000);
   }
   function hideToast() {
     clearTimeout(toastTimer);
     toast.classList.remove('show');
   }
+  function showFab() {
+    fab.classList.add('show');
+  }
+  function hideFab() {
+    fab.classList.remove('show');
+  }
 
   toast.addEventListener('click', e => {
     if (e.target === toastClose) { hideToast(); return; }
+    hideToast();
+    hideFab();
+    clearTimeout(autoOpenTimer);
+    openModal();
+  });
+
+  // FAB click — always works, any page, any scroll position
+  fab.addEventListener('click', () => {
+    hideFab();
     hideToast();
     clearTimeout(autoOpenTimer);
     openModal();
@@ -703,6 +787,7 @@
   ──────────────────────────────────────────────────────────────── */
   function openModal() {
     if (modal.classList.contains('open')) return;
+    hideFab(); // always hide FAB when modal opens
     modal.classList.add('open');
     document.body.style.overflow = 'hidden';
     resetModal();
@@ -947,13 +1032,17 @@
         ).toLowerCase();
 
         if (text.includes(TRIGGER_PHRASE.toLowerCase())) {
-          // Show toast immediately
+          // Show toast at top of page
           showToast(TOAST_TEXT);
 
-          // Auto-open modal after delay
+          // Show floating button above widget — works on ANY page
+          showFab();
+
+          // Auto-open modal after delay (hides both toast and FAB)
           clearTimeout(autoOpenTimer);
           autoOpenTimer = setTimeout(() => {
             hideToast();
+            hideFab();
             openModal();
           }, AUTO_OPEN_DELAY_MS);
 
