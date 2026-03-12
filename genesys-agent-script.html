@@ -820,6 +820,76 @@
   });
 
   /* ─────────────────────────────────────────────────────────────
+     TOKEN RETRIEVAL
+     ─────────────────────────────────────────────────────────────
+     Script pages run inside an iframe in the Genesys desktop.
+     The agent's OAuth token can be retrieved four ways depending
+     on the desktop version. We try all of them in sequence.
+
+     METHOD 1 — URL param (most reliable, zero code required)
+       Pass the token into the page via a Script variable + URL:
+         In Script designer → Variables → create string var "AgentToken"
+         Set Variable action on page load:
+           AgentToken = (not settable directly — use Method 4 instead)
+       NOTE: Don't use this for tokens — use Method 4 below.
+
+     METHOD 2 — window.mypurecloud (legacy Genesys desktop)
+       Available when the Script page is loaded inside the old
+       Genesys Cloud desktop (pre-2022).
+
+     METHOD 3 — window.purecloud (intermediate desktop versions)
+
+     METHOD 4 — postMessage from parent frame (RECOMMENDED)
+       The Genesys desktop injects the token via postMessage when
+       the Script page iframe loads. We listen for it proactively.
+       To enable this, in the Genesys Script designer add a
+       Custom Action on Page Load:
+         Action: Execute JavaScript
+         Code: window.frames[0].postMessage(
+                 { type: 'genesys_token', token: Scripter.Token },
+                 '*'
+               );
+       NOTE: Scripter.Token is available as a built-in in some
+       desktop versions. Check your version's variable list.
+
+     METHOD 5 — Proxy backend (production recommendation)
+       Host a small backend endpoint that exchanges a short-lived
+       code for a token server-side. The Script page calls YOUR
+       backend, which calls the Platform API. No token in browser.
+       Use this approach if Methods 1-4 are unavailable.
+  ──────────────────────────────────────────────────────────────── */
+
+  // Token storage — populated by any method that succeeds
+  let cachedToken = null;
+
+  // Try all synchronous sources immediately on load
+  function tryGetTokenSync() {
+    try { if (window.mypurecloud?.getAccessToken?.()) return window.mypurecloud.getAccessToken(); } catch(_) {}
+    try { if (window.purecloud?.getAccessToken?.())   return window.purecloud.getAccessToken();   } catch(_) {}
+    try { if (window.parent?.mypurecloud?.getAccessToken?.()) return window.parent.mypurecloud.getAccessToken(); } catch(_) {}
+    try { if (window.top?.mypurecloud?.getAccessToken?.())    return window.top.mypurecloud.getAccessToken();    } catch(_) {}
+    // Check URL param (set via Script variable in Web Page Source URL)
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('token')) return p.get('token');
+    return null;
+  }
+  cachedToken = tryGetTokenSync();
+
+  // METHOD 4 — listen for postMessage token from parent desktop frame
+  window.addEventListener('message', e => {
+    if (!e.data || typeof e.data !== 'object') return;
+    // Genesys desktop postMessage formats (varies by version):
+    if (e.data.type === 'genesys_token'  && e.data.token)       cachedToken = e.data.token;
+    if (e.data.type === 'scripter_token' && e.data.token)       cachedToken = e.data.token;
+    if (e.data.accessToken)                                      cachedToken = e.data.accessToken;
+    if (e.data.token && typeof e.data.token === 'string')        cachedToken = e.data.token;
+  });
+
+  // Request token from parent frame proactively (some desktop versions respond to this)
+  try { window.parent.postMessage({ type: 'request_token', source: 'script_page' }, '*'); } catch(_) {}
+  try { window.top.postMessage(    { type: 'request_token', source: 'script_page' }, '*'); } catch(_) {}
+
+  /* ─────────────────────────────────────────────────────────────
      STEP 1 — NOTIFY CUSTOMER
      ─────────────────────────────────────────────────────────────
      Sends a message into the active web messaging conversation
@@ -827,19 +897,8 @@
      messagesReceived SDK event on the customer's page, which
      shows the upload toast and auto-opens the secure upload modal.
 
-     Requires: conversationId from Script context
-               Agent OAuth token (retrieved from Genesys SDK)
-
-     Platform API endpoint:
-       POST /api/v2/conversations/{conversationId}/messages
-       Authorization: Bearer {token}
-       Content-Type: application/json
-       { "textBody": "...", "messagingTemplate": null }
-
-     Note: In a Script page context the agent's OAuth token is
-     available via window.mypurecloud.getAccessToken() if the
-     Genesys desktop SDK is loaded, or via the Script SDK
-     pcConversations / communication helpers.
+     If no token is available via SDK methods, the button falls
+     back to showing manual instructions for the agent.
   ──────────────────────────────────────────────────────────────── */
   notifyBtn.addEventListener('click', async () => {
     if (!ctx.conversationId) {
@@ -847,43 +906,50 @@
       return;
     }
 
+    // Re-try token on click in case postMessage arrived after page load
+    if (!cachedToken) cachedToken = tryGetTokenSync();
+
+    if (!cachedToken) {
+      // ── FALLBACK: no token available ────────────────────────
+      // Show the agent exactly what message to type manually.
+      // The customer page listens for "please upload" in any message.
+      showBanner(
+        '⚠️ Auto-notify unavailable — token not found in desktop SDK. ' +
+        'Please type this in the chat manually: "' + CUSTOMER_NOTIFY_MSG + '"',
+        'warning'
+      );
+      // Still mark as actioned so agent knows what to do
+      notifyBtn.textContent = '📋 Copy Message';
+      notifyBtn.disabled    = false;
+      notifyBtn.onclick     = () => {
+        navigator.clipboard?.writeText?.(CUSTOMER_NOTIFY_MSG).catch(() => {});
+        notifyBtn.textContent = '✓ Copied';
+        notifyBadge.classList.add('show');
+      };
+      return;
+    }
+
     notifyBtn.disabled = true;
     notifyBtn.textContent = '⏳ Sending…';
 
     try {
-      // Retrieve the agent's OAuth token from the Genesys desktop SDK
-      // In Genesys Script pages this is typically available as:
-      //   window.mypurecloud.getAccessToken()  — legacy desktop
-      //   window.purecloud.getAccessToken()     — newer desktop
-      // Adjust to match your desktop SDK version.
-      let token = null;
-      try {
-        token = window.mypurecloud?.getAccessToken?.()
-             || window.purecloud?.getAccessToken?.()
-             || null;
-      } catch (_) {}
-
-      if (!token) {
-        // Fallback: if token not available via SDK, show instruction
-        // In production you may proxy this through your own backend
-        throw new Error(
-          'Agent OAuth token not available from desktop SDK. ' +
-          'Send the message manually or configure token retrieval.'
-        );
-      }
-
       const res = await fetch(
         `${GENESYS_API_BASE}/api/v2/conversations/${ctx.conversationId}/messages`,
         {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${token}`,
+            'Authorization': `Bearer ${cachedToken}`,
             'Content-Type':  'application/json'
           },
           body: JSON.stringify({ textBody: CUSTOMER_NOTIFY_MSG })
         }
       );
 
+      if (res.status === 401) {
+        // Token expired — clear cache and fall back to manual
+        cachedToken = null;
+        throw new Error('Token expired (401). Click again to copy the message manually.');
+      }
       if (!res.ok) throw new Error(`Platform API HTTP ${res.status}`);
 
       notifyBtn.textContent = '✓ Sent';
@@ -893,7 +959,7 @@
     } catch (err) {
       notifyBtn.disabled    = false;
       notifyBtn.textContent = '💬 Request Doc';
-      showBanner(`Could not notify customer: ${err.message}`, 'warning');
+      showBanner(`Could not auto-notify: ${err.message}`, 'warning');
     }
   });
 
