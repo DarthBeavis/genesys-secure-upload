@@ -601,19 +601,26 @@
      ★  CONFIG — replace all values marked REPLACE
   ──────────────────────────────────────────────────────────────── */
 
-  // Document upload API (from your spec)
-  const DOC_API_URL  = 'https://xxx.xxx.xxx/genesys-chat/upload/document'; // ← REPLACE
-  const DOC_API_USER = 'myusername';   // ← REPLACE
-  const DOC_API_PASS = 'mypassword';   // ← REPLACE
+  // Document upload API
+  const DOC_API_URL  = 'https://api.dev.rbfcu.org/genesys-chat/upload/document';
+  const DOC_API_USER = 'genesysapiuser';
+  const DOC_API_PASS = 'REPLACE_WITH_PASSWORD'; // ← swap in when received
 
   // Genesys Platform API base URL for your org region
   // e.g. 'https://api.mypurecloud.com' or 'https://api.mypurecloud.ie'
   const GENESYS_API_BASE = 'https://api.mypurecloud.com'; // ← REPLACE
 
   // Message sent to customer to trigger the upload modal on their screen.
-  // Must contain the TRIGGER_PHRASE configured in the customer-facing page
-  // (default: "please upload")
-  const CUSTOMER_NOTIFY_MSG = 'Please upload your document using the secure upload button on this page.';
+  // IMPORTANT: Must start with "please upload" followed by identifierType and identifier
+  // so the customer-facing script can parse them from the same message.
+  // This is built dynamically at send time using conversation context.
+  function buildNotifyMsg(identifierType, identifier) {
+    if (identifierType && identifier) {
+      return `please upload ${identifierType} ${identifier}`;
+    }
+    // Fallback if context isn't available — agent will need to add details manually
+    return 'please upload';
+  }
 
   // File constraints — match your server's limits
   const MAX_BYTES = 10 * 1024 * 1024;
@@ -906,23 +913,29 @@
       return;
     }
 
+    // Build trigger message from context — customer script parses identifierType + identifier from it
+    const notifyMsg = buildNotifyMsg(ctx.identifierType, ctx.identifier);
+    if (!ctx.identifierType || !ctx.identifier) {
+      showBanner('⚠️ Identifier Type or Identifier not set — complete Step 2 before notifying the customer.', 'warning');
+      return;
+    }
+
     // Re-try token on click in case postMessage arrived after page load
     if (!cachedToken) cachedToken = tryGetTokenSync();
 
     if (!cachedToken) {
       // ── FALLBACK: no token available ────────────────────────
       // Show the agent exactly what message to type manually.
-      // The customer page listens for "please upload" in any message.
       showBanner(
         '⚠️ Auto-notify unavailable — token not found in desktop SDK. ' +
-        'Please type this in the chat manually: "' + CUSTOMER_NOTIFY_MSG + '"',
+        'Please type this in the chat manually: "' + notifyMsg + '"',
         'warning'
       );
       // Still mark as actioned so agent knows what to do
       notifyBtn.textContent = '📋 Copy Message';
       notifyBtn.disabled    = false;
       notifyBtn.onclick     = () => {
-        navigator.clipboard?.writeText?.(CUSTOMER_NOTIFY_MSG).catch(() => {});
+        navigator.clipboard?.writeText?.(notifyMsg).catch(() => {});
         notifyBtn.textContent = '✓ Copied';
         notifyBadge.classList.add('show');
       };
@@ -941,7 +954,7 @@
             'Authorization': `Bearer ${cachedToken}`,
             'Content-Type':  'application/json'
           },
-          body: JSON.stringify({ textBody: CUSTOMER_NOTIFY_MSG })
+          body: JSON.stringify({ textBody: notifyMsg })
         }
       );
 
