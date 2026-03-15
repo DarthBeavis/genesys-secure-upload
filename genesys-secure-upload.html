@@ -15,25 +15,25 @@
         Messenger Configurations > File Attachment = DISABLED
         This is the server-side gate that prevents bypass of the scan.
   =================================================================-->
-  <script>
-    (function (g, e, n, es, ys) {
-      g['_genesysJs'] = e;
-      g[e] = g[e] || function () { (g[e].q = g[e].q || []).push(arguments); };
-      g[e].t = 1 * new Date();
-      g[e].c = es;
-      ys = document.createElement('script');
-      ys.async = 1;
-      ys.src = n;
-      ys.charset = 'utf-8';
-      document.head.appendChild(ys);
-    })(window, 'Genesys',
-      'https://apps.YOUR_GENESYS_ENV/genesys-bootstrap/genesys.min.js',
-      {
-        environment: 'YOUR_GENESYS_ENV',   // ← REPLACE
-        deploymentId: 'YOUR_DEPLOYMENT_ID' // ← REPLACE
-      }
-    );
-  </script>
+
+(function injectGenesysSnippet() {
+  if (typeof Genesys === 'function') return; // already on page, skip
+  (function (g, e, n, es, ys) {
+    g['_genesysJs'] = e;
+    g[e] = g[e] || function () { (g[e].q = g[e].q || []).push(arguments); };
+    g[e].t = 1 * new Date();
+    g[e].c = es;
+    ys = document.createElement('script');
+    ys.async = 1;
+    ys.src = n;
+    ys.charset = 'utf-8';
+    document.head.appendChild(ys);
+  })(window, 'Genesys', 'https://apps.mypurecloud.com/genesys-bootstrap/genesys.min.js', {
+    environment: 'prod',
+    deploymentId: 'e5622e85-6c23-4837-af46-3964ceec58d1'
+  });
+})();
+
 
   <style>
     /* Hide native Genesys attach button — belt-and-suspenders */
